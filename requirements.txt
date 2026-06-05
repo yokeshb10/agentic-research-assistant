@@ -1,0 +1,5 @@
+streamlit
+langgraph
+pypdf
+google-genai
+python-dotenv
