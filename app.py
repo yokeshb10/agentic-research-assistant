@@ -62,6 +62,6 @@ if uploaded is not None:
                         snippet = it["text"][:200].replace("\n", " ")
                         st.markdown(f"**[{i}]** (score {it['score']:.3f}) — {snippet}...")
         except Exception as e:
-            st.error("Something went wrong (possibly a rate limit). Please try again in a moment.")
+            st.error(f"Error: {type(e).__name__}: {e}")
 else:
     st.info("Please upload a PDF to begin.")
