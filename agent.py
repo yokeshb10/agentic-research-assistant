@@ -204,7 +204,11 @@ Question: {question}
 
 Output:"""
     text = groq_generate(prompt)
-    subqs = [line.strip(" -•\t") for line in text.splitlines() if line.strip()]
+    subqs = []
+    for line in text.splitlines():
+        cleaned = line.strip().lstrip("-•*0123456789. )").strip()
+        if cleaned:
+            subqs.append(cleaned)
     return subqs if subqs else [question]
 
 

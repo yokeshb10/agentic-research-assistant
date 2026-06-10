@@ -43,8 +43,8 @@ if uploaded is not None:
             # show the plan only if it actually split into multiple sub-questions
             if len(result["sub_questions"]) > 1:
                 with st.expander(f"🧭 Research plan ({len(result['sub_questions'])} sub-questions)"):
-                    for sq in result["sub_questions"]:
-                        st.markdown(f"- {sq}")
+                    for i, sq in enumerate(result["sub_questions"], 1):
+                        st.write(f"{i}) {sq}")
 
             st.subheader("Answer")
             st.write(result["final_answer"])
