@@ -16,14 +16,17 @@ class State(TypedDict):
     top_k: int
 
 from google import genai
-from google.genai import errors
+from groq import Groq
 import math, time
 
-client = genai.Client()
+client = genai.Client()        # Gemini — used ONLY for embeddings
+groq_client = Groq()           # Groq — used for all generation (reads GROQ_API_KEY)
 
-# --- global pacing + retry ---
+GROQ_MODEL = "llama-3.3-70b-versatile"
+
+# --- global pacing + retry (handles both providers' rate-limit errors) ---
 _last_call_time = [0.0]
-MIN_GAP_SECONDS = 4.5
+MIN_GAP_SECONDS = 2.0          # Groq's free tier is more generous, so shorter gap
 
 def call_with_retry(fn, max_attempts=5):
     for attempt in range(max_attempts):
@@ -33,20 +36,30 @@ def call_with_retry(fn, max_attempts=5):
         _last_call_time[0] = time.time()
         try:
             return fn()
-        except (errors.ServerError, errors.ClientError) as e:
-            code = getattr(e, "code", None)
-            if code in (429, 503) and attempt < max_attempts - 1:
+        except Exception as e:
+            msg = str(e).lower()
+            transient = "429" in msg or "rate" in msg or "503" in msg or "quota" in msg
+            if transient and attempt < max_attempts - 1:
                 time.sleep(2 ** attempt)
             else:
                 raise
+
+def groq_generate(prompt):
+    """Generate text via Groq (Llama). Hides the message-format difference."""
+    resp = call_with_retry(lambda: groq_client.chat.completions.create(
+        model=GROQ_MODEL,
+        messages=[{"role": "user", "content": prompt}],
+    ))
+    return resp.choices[0].message.content
 
 def cosine_similarity(a, b):
     dot = sum(x * y for x, y in zip(a, b))
     mag_a = math.sqrt(sum(x * x for x in a))
     mag_b = math.sqrt(sum(y * y for y in b))
     return dot / (mag_a * mag_b)
+
 def build_index_from_text(text):
-    """Chunk document text on section headings and embed each chunk."""
+    """Chunk document text on section headings and embed each chunk (Gemini embeddings)."""
     import re
     parts = re.split(r'\n(?=\d+\.\s)', text)
     chunks = [p.strip() for p in parts if p.strip()]
@@ -58,7 +71,7 @@ def build_index_from_text(text):
         indexed.append({"text": chunk, "embedding": emb})
     return indexed
 
-# ---------- NODE 1: retrieve ----------
+# ---------- NODE 1: retrieve (Gemini embeddings) ----------
 def retrieve_node(state: State):
     question = state["question"]
     indexed = state["indexed"]
@@ -74,7 +87,7 @@ def retrieve_node(state: State):
     scored.sort(key=lambda x: x["score"], reverse=True)
     return {"sources": scored[:top_k], "attempts": attempts + 1}
 
-# ---------- NODE 2: generate ----------
+# ---------- NODE 2: generate (Groq) ----------
 def generate_node(state: State):
     question = state["question"]
     sources = state["sources"]
@@ -91,12 +104,10 @@ Context:
 Question: {question}
 
 Answer:"""
-    answer = call_with_retry(lambda: client.models.generate_content(
-        model="gemini-2.5-flash-lite", contents=prompt
-    )).text
+    answer = groq_generate(prompt)
     return {"answer": answer}
 
-# ---------- NODE 3: verify ----------
+# ---------- NODE 3: verify (Groq) ----------
 def verify_node(state: State):
     answer = state["answer"]
     sources = state["sources"]
@@ -123,9 +134,7 @@ QUESTION: {question}
 ANSWER: {answer}
 
 Verdict:"""
-    verdict_text = call_with_retry(lambda: client.models.generate_content(
-        model="gemini-2.5-flash-lite", contents=prompt
-    )).text.strip()
+    verdict_text = groq_generate(prompt).strip()
 
     status = "verified" if verdict_text.upper().startswith("GROUNDED") else "unverified"
     return {"status": status, "verdict": verdict_text}
@@ -164,24 +173,37 @@ graph = builder.compile()
 def run_agent(question, indexed):
     return graph.invoke({"question": question, "indexed": indexed})
 
-# ============ PLANNER LAYER ============
+# ============ QUICK PATH (no planner) ============
+
+def run_quick(question, indexed):
+    """Single-question path: no planner. Fewer calls, no planner to mangle simple questions."""
+    result = run_agent(question, indexed)
+    return {
+        "final_answer": result["answer"],
+        "sub_results": [{
+            "question": question,
+            "answer": result["answer"],
+            "status": result["status"],
+            "sources": result["sources"],
+        }],
+        "sub_questions": [question],
+    }
+
+# ============ PLANNER LAYER (deep research) ============
 
 def plan(question):
-    prompt = f"""You are a research planner. Break the user's question into the
-minimal set of focused sub-questions needed to answer it.
+    prompt = f"""You are a research planner. Decide whether the user's question needs to be broken down.
 
-Rules:
-- If the question is already simple and focused, return it UNCHANGED as a single line.
-- Never invent more than 4 sub-questions.
-- Each sub-question must be self-contained and answerable on its own.
-- Output ONE sub-question per line. No numbering, no extra text.
+CRITICAL RULES:
+- If the question asks for ONE fact or is already simple, return it EXACTLY AS WRITTEN, unchanged, as a single line. Do NOT rephrase it.
+- Only split if the question genuinely contains MULTIPLE distinct asks (e.g. "compare X and Y", "what is A and also B").
+- Never change the meaning of the question. Never invent a different question.
+- Output ONE question per line. No numbering, no extra text.
 
 Question: {question}
 
-Sub-questions:"""
-    text = call_with_retry(lambda: client.models.generate_content(
-        model="gemini-2.5-flash-lite", contents=prompt
-    )).text
+Output:"""
+    text = groq_generate(prompt)
     subqs = [line.strip(" -•\t") for line in text.splitlines() if line.strip()]
     return subqs if subqs else [question]
 
@@ -200,9 +222,7 @@ FINDINGS:
 {combined}
 
 Final answer:"""
-    return call_with_retry(lambda: client.models.generate_content(
-        model="gemini-2.5-flash-lite", contents=prompt
-    )).text
+    return groq_generate(prompt)
 
 
 def run_research(question, indexed):
@@ -225,26 +245,11 @@ def run_research(question, indexed):
 # --- temporary test ---
 if __name__ == "__main__":
     from pypdf import PdfReader
-    import re
 
     reader = PdfReader("Lumora_Robotics_Annual_Report_2024.pdf")
     text = "".join(page.extract_text() for page in reader.pages)
-    parts = re.split(r'\n(?=\d+\.\s)', text)
-    chunks = [p.strip() for p in parts if p.strip()]
+    indexed = build_index_from_text(text)
 
-    indexed = []
-    for chunk in chunks:
-        emb = call_with_retry(lambda: client.models.embed_content(
-            model="gemini-embedding-001", contents=chunk
-        )).embeddings[0].values
-        indexed.append({"text": chunk, "embedding": emb})
-
-    result = run_research(
-        "Compare Lumora's 2024 revenue growth to its employee headcount, "
-        "and say whether the company is growing efficiently.",
-        indexed
-    )
-    print("SUB-QUESTIONS:")
-    for sq in result["sub_questions"]:
-        print("  -", sq)
-    print("\nFINAL ANSWER:\n", result["final_answer"])
+    result = run_quick("Who is the CEO of Lumora Robotics?", indexed)
+    print("ANSWER:", result["final_answer"])
+    print("STATUS:", result["sub_results"][0]["status"])

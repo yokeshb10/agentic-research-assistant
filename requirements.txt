@@ -3,3 +3,4 @@ langgraph
 pypdf
 google-genai
 python-dotenv
+groq

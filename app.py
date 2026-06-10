@@ -5,8 +5,7 @@ import streamlit as st
 from pypdf import PdfReader
 import io
 
-# import the "brain" from agent.py — single source of truth for AI logic
-from agent import build_index_from_text, run_research
+from agent import build_index_from_text, run_research, run_quick
 
 @st.cache_resource
 def get_index(file_bytes):
@@ -26,13 +25,22 @@ if uploaded is not None:
         indexed = get_index(file_bytes)
     st.success(f"Indexed {len(indexed)} sections. Ask away!")
 
+    mode = st.radio(
+        "Mode",
+        ["Quick answer", "Deep research (splits complex questions, slower)"],
+        horizontal=True,
+    )
     question = st.text_input("Your question:")
+
     if question:
         try:
-            with st.spinner("Planning, retrieving, and verifying... (this can take a moment)"):
-                result = run_research(question, indexed)
+            with st.spinner("Working... (deep research can take ~30-60s on the free tier)"):
+                if mode.startswith("Quick"):
+                    result = run_quick(question, indexed)
+                else:
+                    result = run_research(question, indexed)
 
-            # show the plan — proof the system decomposed the question
+            # show the plan only if it actually split into multiple sub-questions
             if len(result["sub_questions"]) > 1:
                 with st.expander(f"🧭 Research plan ({len(result['sub_questions'])} sub-questions)"):
                     for sq in result["sub_questions"]:
@@ -41,7 +49,6 @@ if uploaded is not None:
             st.subheader("Answer")
             st.write(result["final_answer"])
 
-            # per sub-question detail: answer, verification badge, sources
             st.subheader("Details")
             for r in result["sub_results"]:
                 with st.expander(f"📄 {r['question']}"):
