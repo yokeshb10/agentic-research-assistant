@@ -2,16 +2,12 @@ from dotenv import load_dotenv
 load_dotenv()
 
 import streamlit as st
-from pypdf import PdfReader
-import io
-
-from agent import build_index_from_text, run_research, run_quick
+from agent import build_index, run_research, run_quick
 
 @st.cache_resource
-def get_index(file_bytes):
-    reader = PdfReader(io.BytesIO(file_bytes))
-    text = "".join(page.extract_text() for page in reader.pages)
-    return build_index_from_text(text)
+def index_document(file_bytes):
+    """Embed + store the document in the vector DB once; returns (doc_id, num_chunks)."""
+    return build_index(file_bytes)
 
 # ---------- UI ----------
 st.title("Agentic Research Assistant")
@@ -22,8 +18,8 @@ uploaded = st.file_uploader("Upload a PDF", type="pdf")
 if uploaded is not None:
     file_bytes = uploaded.read()
     with st.spinner("Indexing document..."):
-        indexed = get_index(file_bytes)
-    st.success(f"Indexed {len(indexed)} sections. Ask away!")
+        doc_id, num_chunks = index_document(file_bytes)
+    st.success(f"Indexed {num_chunks} sections. Ask away!")
 
     mode = st.radio(
         "Mode",
@@ -36,11 +32,10 @@ if uploaded is not None:
         try:
             with st.spinner("Working... (deep research can take ~30-60s on the free tier)"):
                 if mode.startswith("Quick"):
-                    result = run_quick(question, indexed)
+                    result = run_quick(question, doc_id)
                 else:
-                    result = run_research(question, indexed)
+                    result = run_research(question, doc_id)
 
-            # show the plan only if it actually split into multiple sub-questions
             if len(result["sub_questions"]) > 1:
                 with st.expander(f"🧭 Research plan ({len(result['sub_questions'])} sub-questions)"):
                     for i, sq in enumerate(result["sub_questions"], 1):

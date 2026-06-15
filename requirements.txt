@@ -4,3 +4,4 @@ pypdf
 google-genai
 python-dotenv
 groq
+vecs

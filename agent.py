@@ -2,8 +2,20 @@ from dotenv import load_dotenv
 load_dotenv()
 
 from typing import TypedDict
-from typing_extensions import Annotated
-import operator
+import os, math, time, hashlib, io, re
+
+from google import genai
+from groq import Groq
+import vecs
+
+client = genai.Client()        # Gemini — embeddings only
+groq_client = Groq()           # Groq — generation
+GROQ_MODEL = "llama-3.3-70b-versatile"
+
+# ---------- vector database ----------
+DB_CONNECTION = os.getenv("DB_CONNECTION")
+vx = vecs.create_client(DB_CONNECTION)
+docs_collection = vx.get_or_create_collection(name="documents", dimension=3072)
 
 class State(TypedDict):
     question: str
@@ -11,22 +23,13 @@ class State(TypedDict):
     answer: str
     status: str
     verdict: str
-    indexed: list
+    doc_id: str
     attempts: int
     top_k: int
 
-from google import genai
-from groq import Groq
-import math, time
-
-client = genai.Client()        # Gemini — used ONLY for embeddings
-groq_client = Groq()           # Groq — used for all generation (reads GROQ_API_KEY)
-
-GROQ_MODEL = "llama-3.3-70b-versatile"
-
-# --- global pacing + retry (handles both providers' rate-limit errors) ---
+# --- global pacing + retry (handles both providers) ---
 _last_call_time = [0.0]
-MIN_GAP_SECONDS = 2.0          # Groq's free tier is more generous, so shorter gap
+MIN_GAP_SECONDS = 2.0
 
 def call_with_retry(fn, max_attempts=5):
     for attempt in range(max_attempts):
@@ -45,36 +48,44 @@ def call_with_retry(fn, max_attempts=5):
                 raise
 
 def groq_generate(prompt):
-    """Generate text via Groq (Llama). Hides the message-format difference."""
     resp = call_with_retry(lambda: groq_client.chat.completions.create(
         model=GROQ_MODEL,
         messages=[{"role": "user", "content": prompt}],
     ))
     return resp.choices[0].message.content
 
-def cosine_similarity(a, b):
-    dot = sum(x * y for x, y in zip(a, b))
-    mag_a = math.sqrt(sum(x * x for x in a))
-    mag_b = math.sqrt(sum(y * y for y in b))
-    return dot / (mag_a * mag_b)
+# ---------- indexing: embed chunks and store in the vector DB ----------
+def build_index(file_bytes):
+    """Embed a PDF's chunks and store them in the vector DB, tagged by document id.
+    Returns (doc_id, num_chunks). Same file bytes -> same doc_id -> no duplicates."""
+    from pypdf import PdfReader
 
-def build_index_from_text(text):
-    """Chunk document text on section headings and embed each chunk (Gemini embeddings)."""
-    import re
+    doc_id = hashlib.sha256(file_bytes).hexdigest()[:16]
+
+    reader = PdfReader(io.BytesIO(file_bytes))
+    text = "".join(page.extract_text() for page in reader.pages)
     parts = re.split(r'\n(?=\d+\.\s)', text)
     chunks = [p.strip() for p in parts if p.strip()]
-    indexed = []
-    for chunk in chunks:
-        emb = call_with_retry(lambda: client.models.embed_content(
-            model="gemini-embedding-001", contents=chunk
-        )).embeddings[0].values
-        indexed.append({"text": chunk, "embedding": emb})
-    return indexed
 
-# ---------- NODE 1: retrieve (Gemini embeddings) ----------
+    records = []
+    for i, chunk in enumerate(chunks):
+        emb = call_with_retry(lambda c=chunk: client.models.embed_content(
+            model="gemini-embedding-001", contents=c
+        )).embeddings[0].values
+        records.append((
+            f"{doc_id}_{i}",                        # unique chunk id
+            emb,                                     # 3072-number vector
+            {"doc_id": doc_id, "text": chunk},       # metadata
+        ))
+
+    docs_collection.upsert(records=records)
+    # fast similarity search
+    return doc_id, len(chunks)
+
+# ---------- NODE 1: retrieve (query the DB, filtered to this document) ----------
 def retrieve_node(state: State):
     question = state["question"]
-    indexed = state["indexed"]
+    doc_id = state["doc_id"]
     top_k = state.get("top_k", 3)
     attempts = state.get("attempts", 0)
 
@@ -82,10 +93,22 @@ def retrieve_node(state: State):
         model="gemini-embedding-001", contents=question
     )).embeddings[0].values
 
-    scored = [{"score": cosine_similarity(q_emb, it["embedding"]), "text": it["text"]}
-              for it in indexed]
-    scored.sort(key=lambda x: x["score"], reverse=True)
-    return {"sources": scored[:top_k], "attempts": attempts + 1}
+    results = docs_collection.query(
+        data=q_emb,
+        limit=top_k,
+        filters={"doc_id": {"$eq": doc_id}},
+        include_metadata=True,
+        include_value=True,
+    )
+
+    sources = []
+    for record_id, distance, metadata in results:
+        sources.append({
+            "text": metadata["text"],
+            "score": 1 - distance,    # vecs returns distance; convert to similarity
+        })
+
+    return {"sources": sources, "attempts": attempts + 1}
 
 # ---------- NODE 2: generate (Groq) ----------
 def generate_node(state: State):
@@ -135,17 +158,15 @@ ANSWER: {answer}
 
 Verdict:"""
     verdict_text = groq_generate(prompt).strip()
-
     status = "verified" if verdict_text.upper().startswith("GROUNDED") else "unverified"
     return {"status": status, "verdict": verdict_text}
 
-# ---------- ROUTER ----------
+# ---------- ROUTER + widen ----------
 def should_retry(state: State):
     if state["status"] == "unverified" and state["attempts"] < 3:
         return "retry"
     return "done"
 
-# ---------- NODE: widen ----------
 def widen_node(state: State):
     return {"top_k": state.get("top_k", 3) + 2}
 
@@ -170,14 +191,13 @@ builder.add_edge("widen", "retrieve")
 
 graph = builder.compile()
 
-def run_agent(question, indexed):
-    return graph.invoke({"question": question, "indexed": indexed})
+def run_agent(question, doc_id):
+    return graph.invoke({"question": question, "doc_id": doc_id})
 
-# ============ QUICK PATH (no planner) ============
+# ============ QUICK PATH ============
 
-def run_quick(question, indexed):
-    """Single-question path: no planner. Fewer calls, no planner to mangle simple questions."""
-    result = run_agent(question, indexed)
+def run_quick(question, doc_id):
+    result = run_agent(question, doc_id)
     return {
         "final_answer": result["answer"],
         "sub_results": [{
@@ -189,7 +209,7 @@ def run_quick(question, indexed):
         "sub_questions": [question],
     }
 
-# ============ PLANNER LAYER (deep research) ============
+# ============ PLANNER LAYER ============
 
 def plan(question):
     prompt = f"""You are a research planner. Decide whether the user's question needs to be broken down.
@@ -229,11 +249,11 @@ Final answer:"""
     return groq_generate(prompt)
 
 
-def run_research(question, indexed):
+def run_research(question, doc_id):
     subqs = plan(question)
     sub_results = []
     for sq in subqs:
-        result = run_agent(sq, indexed)
+        result = run_agent(sq, doc_id)
         sub_results.append({
             "question": sq,
             "answer": result["answer"],
@@ -245,15 +265,3 @@ def run_research(question, indexed):
     else:
         final = synthesize(question, sub_results)
     return {"final_answer": final, "sub_results": sub_results, "sub_questions": subqs}
-
-# --- temporary test ---
-if __name__ == "__main__":
-    from pypdf import PdfReader
-
-    reader = PdfReader("Lumora_Robotics_Annual_Report_2024.pdf")
-    text = "".join(page.extract_text() for page in reader.pages)
-    indexed = build_index_from_text(text)
-
-    result = run_quick("Who is the CEO of Lumora Robotics?", indexed)
-    print("ANSWER:", result["final_answer"])
-    print("STATUS:", result["sub_results"][0]["status"])
